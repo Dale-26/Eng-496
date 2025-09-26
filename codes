@@ -1,1 +1,66 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
 
+const char* ssid = "ESP32_Car";
+const char* password = "12345678";
+
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
+
+// หน้าเว็บ HTML + JS รวมอยู่ในโค้ด
+const char htmlPage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Car Control</title>
+</head>
+<body>
+    <h2>ESP32 Car Control</h2>
+    <button onclick="sendCmd('F')">Forward</button>
+    <button onclick="sendCmd('B')">Backward</button>
+    <button onclick="sendCmd('L')">Left</button>
+    <button onclick="sendCmd('R')">Right</button>
+    <button onclick="sendCmd('S')">Stop</button>
+
+    <script>
+        var ws = new WebSocket('ws://' + location.hostname + ':81/');
+        ws.onopen = function() { console.log('Connected to ESP32'); };
+        function sendCmd(cmd){ ws.send(cmd); }
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// ฟังก์ชันเรียกหน้าเว็บ
+void handleRoot() {
+  server.send(200, "text/html", htmlPage);
+}
+
+// WebSocket Event
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if(type == WStype_TEXT){
+    String cmd = String((char*)payload);
+    Serial.println("Received: " + cmd);
+    Serial1.write(cmd.c_str()); // ส่งไป Arduino
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(9600, SERIAL_8N1, 16, 17); // ESP32 RX/TX → Arduino
+
+  WiFi.softAP(ssid, password);
+  Serial.println("ESP32 AP started. Connect to WiFi: ESP32_Car");
+
+  server.on("/", handleRoot);
+  server.begin();
+
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+}
+
+void loop() {
+  server.handleClient();
+  webSocket.loop();
+}
