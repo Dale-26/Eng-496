@@ -1,2 +1,2 @@
-# automatic minicar for soil sampling (R2)
+# automatic chassis for soil sampling (R2)
 ## เป็นโปรเจกต์ที่ใช้รถในการตรวจสอบสภาพดินว่าพร้อมที่จะเพาะปลูกหรือไม่โดยสามารถดูได้จากมือถือ และสามารถปรับโหมดของรถให้เป็น auto และ manual ได้ โดยมี Ultrasonic สำหรับตรวจจับสิ่งกีดขวาง
