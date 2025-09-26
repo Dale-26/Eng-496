@@ -1,0 +1,204 @@
+#include <AFMotor.h>
+#include <SoftwareSerial.h>
+#include <NewPing.h>
+#include <Servo.h>
+
+// ---------------- Servo ----------------
+#define SERVO_CENTER 90
+#define SERVO_STEP 5
+#define SERVO_DELAY 30
+#define SERVO_PIN 10
+Servo myservo;
+
+// ---------------- Motor ----------------
+AF_DCMotor motorB(2); // M2
+AF_DCMotor motorC(3); // M3
+
+// ---------------- Ultrasonic ----------------
+#define TRIG A0
+#define ECHO A1
+#define MAX_DIST 200
+NewPing sonar(TRIG, ECHO, MAX_DIST);
+
+// ---------------- SoftwareSerial ESP32 ----------------
+SoftwareSerial ESPSerial(A2, A3); // RX, TX
+
+// ---------------- Mode ----------------
+String mode = "MANUAL";
+
+// ---------------- Auto state machine ----------------
+enum AutoState { AUTO_FORWARD, AUTO_SCAN, AUTO_TURN };
+AutoState autoState = AUTO_FORWARD;
+unsigned long stateStart = 0;
+
+// ---------------- Turn direction ----------------
+int turnDir = 0; // -1=left,0=center,1=right
+
+// ---------------- Timing ----------------
+unsigned long lastPing = 0;
+const unsigned long pingInterval = 50;
+int distance = 250;
+
+// ---------------- Servo scanning ----------------
+int servoTarget = SERVO_CENTER;
+int servoPos = SERVO_CENTER;
+unsigned long lastServoMove = 0;
+
+int scanLeft = 0, scanCenter = 0, scanRight = 0;
+bool scanDone = false;
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(9600);
+  ESPSerial.begin(9600);
+  myservo.attach(SERVO_PIN);
+  myservo.write(SERVO_CENTER);
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  unsigned long now = millis();
+
+  // อ่านคำสั่งจาก ESP32
+  if (ESPSerial.available()) {
+    String cmd = ESPSerial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "MODE:AUTO") {
+      mode = "AUTO";
+      autoState = AUTO_FORWARD;
+      stateStart = now;
+    } else if (cmd == "MODE:MANUAL") {
+      mode = "MANUAL";
+      stopMotors();
+    } else if (mode == "MANUAL") {
+      handleManual(cmd);
+    }
+  }
+
+  // Update ping
+  if (now - lastPing >= pingInterval) {
+    lastPing = now;
+    distance = readPing();
+  }
+
+  // Auto
+  if (mode == "AUTO") autoDrive(now);
+
+  // Servo non-blocking
+  updateServo(now);
+}
+
+// ---------------- Manual ----------------
+void handleManual(String cmd) {
+  if (cmd == "F") forward();
+  else if (cmd == "B") backward();
+  else if (cmd == "L") left();
+  else if (cmd == "R") right();
+  else if (cmd == "S") stopMotors();
+}
+
+// ---------------- Auto ----------------
+void autoDrive(unsigned long now) {
+  switch(autoState) {
+    case AUTO_FORWARD:
+      forward();
+      if(distance <= 30) { // สิ่งกีดขวาง
+        stopMotors();
+        autoState = AUTO_SCAN;
+        scanDone = false;
+        servoTarget = 0; // เริ่ม scan ซ้ายสุด
+        scanLeft = scanCenter = scanRight = 0;
+        stateStart = now;
+      }
+      break;
+
+    case AUTO_SCAN:
+      if(scanDone) {
+        int maxDist = scanLeft;
+        int dir = -1;
+        if(scanCenter > maxDist) { maxDist = scanCenter; dir = 0; }
+        if(scanRight > maxDist) { maxDist = scanRight; dir = 1; }
+
+        startTurn(dir);
+        autoState = AUTO_TURN;
+        stateStart = now;
+      }
+      break;
+
+    case AUTO_TURN:
+      if(turnDir == 1) right();
+      else if(turnDir == -1) left();
+      else forward();
+
+      if(now - stateStart >= 400) {
+        stopMotors();
+        autoState = AUTO_FORWARD;
+        stateStart = now;
+        forward();
+      }
+      break;
+  }
+}
+
+// ---------------- Start Turn ----------------
+void startTurn(int dir) {
+  turnDir = dir;
+}
+
+// ---------------- Servo update ----------------
+void updateServo(unsigned long now) {
+  if(now - lastServoMove >= SERVO_DELAY) {
+    lastServoMove = now;
+
+    if(servoPos < servoTarget) servoPos += SERVO_STEP;
+    else if(servoPos > servoTarget) servoPos -= SERVO_STEP;
+
+    if(servoPos > 180) servoPos = 180;
+    if(servoPos < 0) servoPos = 0;
+
+    myservo.write(servoPos);
+
+    int dist = readPing();
+
+    if(servoTarget == 0 && servoPos <= 0) { scanLeft = dist; servoTarget = 180; }
+    else if(servoTarget == 180 && servoPos >= 180) { scanRight = dist; servoTarget = 90; }
+    else if(servoTarget == 90 && servoPos == 90) { 
+      scanCenter = dist; 
+      scanDone = true;
+    }
+  }
+}
+
+// ---------------- Motor Control ----------------
+void forward() {
+  motorB.setSpeed(255); motorC.setSpeed(255);
+  motorB.run(FORWARD); motorC.run(FORWARD);
+}
+
+void backward() {
+  motorB.setSpeed(255); motorC.setSpeed(255);
+  motorB.run(BACKWARD); motorC.run(BACKWARD);
+}
+
+void left() {
+  motorB.setSpeed(150); motorC.setSpeed(255);
+  motorB.run(BACKWARD); motorC.run(FORWARD);
+}
+
+void right() {
+  motorB.setSpeed(255); motorC.setSpeed(150);
+  motorB.run(FORWARD); motorC.run(BACKWARD);
+}
+
+void stopMotors() {
+  motorB.run(RELEASE);
+  motorC.run(RELEASE);
+}
+
+// ---------------- Ultrasonic ----------------
+int readPing() {
+  int cm = sonar.ping_cm();
+  if(cm == 0) cm = 250;
+  return cm;
+}
