@@ -1,0 +1,54 @@
+#include <AFMotor.h>
+#include <SoftwareSerial.h>
+
+// Motor B = M2, Motor C = M3 บน Shield
+AF_DCMotor motorB(2);
+AF_DCMotor motorC(3);
+
+// SoftwareSerial: A2 = RX, A3 = TX
+SoftwareSerial ESPSerial(A2, A3); // RX, TX
+
+void setup() {
+  Serial.begin(9600);        // Serial Monitor
+  ESPSerial.begin(9600);     // รับคำสั่งจาก ESP32
+}
+
+void loop() {
+  if (ESPSerial.available()) {
+    char cmd = ESPSerial.read();
+    Serial.print("Received command: ");
+    Serial.println(cmd);
+    switch(cmd) {
+      case 'F': forward(); break;
+      case 'B': backward(); break;
+      case 'L': left(); break;
+      case 'R': right(); break;
+      case 'S': stopMotors(); break;
+    }
+  }
+}
+
+// ฟังก์ชันควบคุมมอเตอร์
+void forward() {
+  motorB.setSpeed(255); motorC.setSpeed(255);
+  motorB.run(FORWARD); motorC.run(FORWARD);
+}
+
+void backward() {
+  motorB.setSpeed(255); motorC.setSpeed(255);
+  motorB.run(BACKWARD); motorC.run(BACKWARD);
+}
+
+void left() {
+  motorB.setSpeed(150); motorC.setSpeed(255);
+  motorB.run(BACKWARD); motorC.run(FORWARD);
+}
+
+void right() {
+  motorB.setSpeed(255); motorC.setSpeed(150);
+  motorB.run(FORWARD); motorC.run(BACKWARD);
+}
+
+void stopMotors() {
+  motorB.run(RELEASE); motorC.run(RELEASE);
+}
