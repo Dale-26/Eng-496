@@ -1,0 +1,311 @@
+#include <AFMotor.h>
+#include <SoftwareSerial.h>
+#include <NewPing.h>
+#include <Servo.h>
+
+// ---------------- Servo #1 (สแกน) ----------------
+#define SERVO1_CENTER 90
+#define SERVO1_STEP   5
+#define SERVO1_DELAY  30
+#define SERVO1_PIN    10           // Shield servo D10
+Servo servo1;
+int  s1Target = SERVO1_CENTER;
+int  s1Pos    = SERVO1_CENTER;
+unsigned long lastS1Move = 0;
+
+// ---------------- Servo #2 (สั่งงาน) ----------------
+#define SERVO2_CENTER 20
+#define SERVO2_STEP   8
+#define SERVO2_DELAY  30
+#define SERVO2_PIN    9            // Shield servo D9
+#define S2_UP_ANGLE    20
+#define S2_DOWN_ANGLE 130
+#define S2_RET_DELAY   10000UL     // 10 s
+Servo servo2;
+int  s2Target = SERVO2_CENTER;
+int  s2Pos    = SERVO2_CENTER;
+unsigned long lastS2Move = 0;
+unsigned long s2ReturnAt = 0;      // 0 = ไม่ตั้งคิวกลับขึ้น
+
+// (ถ้ามีปุ่มจริงสำหรับ Servo2)
+#define BTN_S2_UP_PIN     A4       // ไป 20°
+#define BTN_S2_DOWN_PIN   A5       // ไป 130°
+const unsigned long BTN_DEBOUNCE_MS = 50;
+unsigned long lastBtnUpMs = 0, lastBtnDownMs = 0;
+int lastUpState = HIGH, lastDownState = HIGH;
+
+// ---------------- Motor ----------------
+AF_DCMotor motorB(2); // M2 (ซ้าย)
+AF_DCMotor motorC(3); // M3 (ขวา)
+const uint8_t SPD_FWD       = 255;
+const uint8_t SPD_TURN_FAST = 255;
+const uint8_t SPD_TURN_SLOW = 150;
+
+// ---------------- Ultrasonic ----------------
+#define TRIG A0
+#define ECHO A1
+#define MAX_DIST 200
+NewPing sonar(TRIG, ECHO, MAX_DIST);
+
+// ---------------- SoftwareSerial ESP32 ----------------
+SoftwareSerial ESPSerial(A2, A3); // RX, TX
+
+// ---------------- Mode ----------------
+String mode = "MANUAL";
+
+// ---------------- Auto state machine ----------------
+enum AutoState { AUTO_FORWARD, AUTO_SCAN, AUTO_TURN };
+AutoState autoState = AUTO_FORWARD;
+unsigned long stateStart = 0;
+
+// ---------------- Turn direction ----------------
+int turnDir = 0; // -1=left,0=center,1=right
+
+// ---------------- Timing ----------------
+unsigned long lastPing = 0;
+const unsigned long pingInterval = 60;
+int distance_cm = 250;
+
+// cooldown กันเลี้ยวถี่เกิน
+unsigned long lastAvoid = 0;
+const unsigned long avoidCooldown = 600;
+
+// ---------------- สแกนด้วย Servo1 ----------------
+int scanLeft = 0, scanCenter = 0, scanRight = 0;
+bool scanDone = false;
+
+// ---------------- Helpers ----------------
+inline bool near(int a, int b, int tol=SERVO1_STEP) { return abs(a - b) <= tol; }
+inline int  clampAng(int a) { return a<0?0:(a>180?180:a); }
+
+// ---------------- Prototypes ----------------
+void handleManual(String cmd);
+void autoDrive(unsigned long now);
+void startTurn(int dir);
+void updateServo1(unsigned long now);
+void updateServo2(unsigned long now);
+void serviceS2DelayedReturn(unsigned long now);
+void checkServo2Buttons(unsigned long now);
+void forward();
+void backward();
+void left();
+void right();
+void stopMotors();
+int  readPingMedian();
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(9600);
+  ESPSerial.begin(9600);
+
+  // Servo1 (สแกน)
+  servo1.attach(SERVO1_PIN);
+  servo1.write(SERVO1_CENTER);
+  s1Pos = s1Target = SERVO1_CENTER;
+
+  // Servo2 (สั่งงาน)
+  servo2.attach(SERVO2_PIN);
+  servo2.write(SERVO2_CENTER);
+  s2Pos = s2Target = SERVO2_CENTER;
+
+  // ปุ่มจริง (ถ้าไม่ได้ใช้ก็ยังคอมไพล์ได้)
+  pinMode(BTN_S2_UP_PIN,   INPUT_PULLUP);
+  pinMode(BTN_S2_DOWN_PIN, INPUT_PULLUP);
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  unsigned long now = millis();
+
+  // อ่านคำสั่งจาก ESP32
+  if (ESPSerial.available()) {
+    String cmd = ESPSerial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "MODE:AUTO") {
+      mode = "AUTO";
+      autoState = AUTO_FORWARD;
+      stateStart = now;
+    } else if (cmd == "MODE:MANUAL") {
+      mode = "MANUAL";
+      stopMotors();
+    } else if (mode == "MANUAL") {
+      handleManual(cmd);
+    }
+  }
+
+  // ระยะอัลตร้าโซนิก
+  if (now - lastPing >= pingInterval) {
+    lastPing = now;
+    distance_cm = readPingMedian();
+  }
+
+  // ปุ่มจริงของ Servo2 (ทำงานทุกโหมด)
+  checkServo2Buttons(now);
+
+  // โหมด AUTO
+  if (mode == "AUTO") autoDrive(now);
+
+  // จัดการนับถอยหลังก่อนให้ Servo2 กลับขึ้น (non-blocking)
+  serviceS2DelayedReturn(now);
+
+  // อัปเดตเซอร์โวทั้งสอง (non-blocking)
+  updateServo1(now);
+  updateServo2(now);
+}
+
+// ---------------- Manual ----------------
+void handleManual(String cmd) {
+  if      (cmd == "F") forward();
+  else if (cmd == "B") backward();
+  else if (cmd == "L") left();
+  else if (cmd == "R") right();
+  else if (cmd == "S") stopMotors();
+
+  // ตั้งมุมตรง ๆ
+  else if (cmd.startsWith("S1:")) { s1Target = clampAng(cmd.substring(3).toInt()); }
+  else if (cmd.startsWith("S2:")) { s2Target = clampAng(cmd.substring(3).toInt()); }
+
+  // คำสั่ง D: (สำหรับ Servo2) ลง 150° → รอ 10s → ขึ้น 20°
+  else if (cmd == "D") {
+    s2Target = S2_DOWN_ANGLE;
+    s2ReturnAt = millis() + S2_RET_DELAY;
+  }
+}
+
+// ---------------- Auto ----------------
+void autoDrive(unsigned long now) {
+  switch(autoState) {
+    case AUTO_FORWARD:
+      forward();
+      if (distance_cm <= 30 && (now - lastAvoid) > avoidCooldown) {
+        stopMotors();
+        autoState = AUTO_SCAN;
+        scanDone = false;
+        // เริ่มสแกน: ซ้าย -> ขวา -> กลาง ด้วย Servo1
+        s1Target = 0;
+        scanLeft = scanCenter = scanRight = 0;
+        stateStart = now;
+      }
+      break;
+
+    case AUTO_SCAN:
+      if (scanDone) {
+        int maxDist = scanLeft;
+        int dir = -1; // ซ้าย
+        if (scanCenter > maxDist) { maxDist = scanCenter; dir = 0; }
+        if (scanRight  > maxDist) { maxDist = scanRight;  dir = 1; }
+
+        startTurn(dir);
+        autoState = AUTO_TURN;
+        stateStart = now;
+        lastAvoid = now;
+      }
+      break;
+
+    case AUTO_TURN:
+      if      (turnDir ==  1) right();
+      else if (turnDir == -1) left();
+      else                    forward();
+
+      if (now - stateStart >= 420) {
+        stopMotors();
+        autoState = AUTO_FORWARD;
+        stateStart = now;
+      }
+      break;
+  }
+}
+
+// ---------------- Start Turn ----------------
+void startTurn(int dir) { turnDir = dir; }
+
+// ---------------- Servo #1 update (สแกน) ----------------
+void updateServo1(unsigned long now) {
+  if (now - lastS1Move < SERVO1_DELAY) return;
+  lastS1Move = now;
+
+  if (s1Pos < s1Target) s1Pos = min(s1Pos + SERVO1_STEP, 180);
+  else if (s1Pos > s1Target) s1Pos = max(s1Pos - SERVO1_STEP, 0);
+  servo1.write(s1Pos);
+
+  // เก็บค่าระยะเมื่อถึงตำแหน่งกำหนด
+  if (s1Target == 0 && near(s1Pos, 0, SERVO1_STEP)) {
+    scanLeft = distance_cm;  s1Target = 180;
+  } else if (s1Target == 180 && near(s1Pos, 180, SERVO1_STEP)) {
+    scanRight = distance_cm; s1Target = 90;
+  } else if (s1Target == 90 && near(s1Pos, 90, SERVO1_STEP)) {
+    scanCenter = distance_cm; scanDone = true;
+  }
+}
+
+// ---------------- Servo #2 update (นุ่ม) ----------------
+void updateServo2(unsigned long now) {
+  if (now - lastS2Move < SERVO2_DELAY) return;
+  lastS2Move = now;
+
+  if (s2Pos < s2Target) s2Pos = min(s2Pos + SERVO2_STEP, 180);
+  else if (s2Pos > s2Target) s2Pos = max(s2Pos - s2Target > 0 ? SERVO2_STEP : 0, 0); // ก้าวทีละ STEP
+  // แก้เล็กน้อยให้ชัดเจน:
+  if (s2Pos > s2Target) s2Pos = max(s2Pos - SERVO2_STEP, 0);
+
+  servo2.write(s2Pos);
+}
+
+// ---------------- จัดการดีเลย์กลับขึ้นของ Servo2 ----------------
+void serviceS2DelayedReturn(unsigned long now) {
+  if (s2ReturnAt != 0 && (long)(now - s2ReturnAt) >= 0) {
+    s2Target = S2_UP_ANGLE;   // กลับขึ้น 20°
+    s2ReturnAt = 0;
+  }
+}
+
+// ---------------- ปุ่มจริงสำหรับ Servo2 ----------------
+void checkServo2Buttons(unsigned long now) {
+  int upState   = digitalRead(BTN_S2_UP_PIN);
+  int downState = digitalRead(BTN_S2_DOWN_PIN);
+
+  if (upState == LOW && lastUpState == HIGH && (now - lastBtnUpMs) > BTN_DEBOUNCE_MS) {
+    s2Target = S2_UP_ANGLE;         // ไป 20°
+    s2ReturnAt = 0;                  // ยกเลิกคิวกลับ (ถ้ามี)
+    lastBtnUpMs = now;
+  }
+  if (downState == LOW && lastDownState == HIGH && (now - lastBtnDownMs) > BTN_DEBOUNCE_MS) {
+    s2Target = S2_DOWN_ANGLE;       // ไป 130°
+    s2ReturnAt = 0;
+    lastBtnDownMs = now;
+  }
+
+  lastUpState = upState;
+  lastDownState = downState;
+}
+
+// ---------------- Motor Control ----------------
+void forward() {
+  motorB.setSpeed(SPD_FWD);  motorC.setSpeed(SPD_FWD);
+  motorB.run(FORWARD);        motorC.run(FORWARD);
+}
+void backward() {
+  motorB.setSpeed(SPD_FWD);  motorC.setSpeed(SPD_FWD);
+  motorB.run(BACKWARD);       motorC.run(BACKWARD);
+}
+void left() {
+  motorB.setSpeed(SPD_TURN_SLOW);  motorC.setSpeed(SPD_TURN_FAST);
+  motorB.run(BACKWARD);             motorC.run(FORWARD);
+}
+void right() {
+  motorB.setSpeed(SPD_TURN_FAST);  motorC.setSpeed(SPD_TURN_SLOW);
+  motorB.run(FORWARD);              motorC.run(BACKWARD);
+}
+void stopMotors() {
+  motorB.run(RELEASE);
+  motorC.run(RELEASE);
+}
+
+// ---------------- Ultrasonic (median) ----------------
+int readPingMedian() {
+  unsigned int u = sonar.ping_median(3) / US_ROUNDTRIP_CM;
+  int cm = (u == 0) ? 250 : (int)u;
+  if (cm > 250) cm = 250;
+  return cm;
+}
